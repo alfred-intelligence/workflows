@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       skill_repo:
-        description: "Skill repo (e.g., Mr-RedHat-fb/ontology-skill)"
+        description: "Skill repo (e.g., owner/repo-name-skill)"
         required: true
         type: string
       skill_ref:
@@ -24,8 +24,10 @@ on:
         type: boolean
 
 env:
-  MARKETPLACE_REPO: alfred-intelligence/claude-marketplace
-  MARKETPLACE_FORK: Mr-RedHat-fb/claude-marketplace
+  MARKETPLACE_REPO: ${{ vars.MARKETPLACE_REPO }}
+  MARKETPLACE_FORK: ${{ vars.MARKETPLACE_FORK }}
+  BOT_USERNAME: ${{ vars.BOT_USERNAME }}
+  BOT_EMAIL: ${{ vars.BOT_EMAIL }}
   MANIFEST_PATH: .claude-plugin/marketplace.json
 
 jobs:
@@ -34,6 +36,19 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Verify configuration
+        run: |
+          missing=()
+          for var in MARKETPLACE_REPO MARKETPLACE_FORK BOT_USERNAME BOT_EMAIL; do
+            if [[ -z "${!var}" ]]; then
+              missing+=("$var")
+            fi
+          done
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::missing required org/repo variable(s): ${missing[*]} — see docs/auth.md"
+            exit 1
+          fi
+
       - name: Checkout skill repo
         uses: actions/checkout@v4
         with:
@@ -70,7 +85,6 @@ jobs:
             HANDLE="$NAME"
           fi
 
-          # Use heredoc syntax so multi-line descriptions survive intact.
           DELIM=$(openssl rand -hex 16)
           {
             echo "name=$NAME"
@@ -92,8 +106,8 @@ jobs:
       - name: Sync fork with upstream
         working-directory: marketplace
         run: |
-          git config user.name "alfred-marketplace-bot"
-          git config user.email "alfred-marketplace-bot@users.noreply.github.com"
+          git config user.name "${BOT_USERNAME}"
+          git config user.email "${BOT_EMAIL}"
           git remote add upstream "https://github.com/${MARKETPLACE_REPO}.git"
           git fetch --quiet upstream main
           git reset --quiet --hard upstream/main
@@ -147,8 +161,10 @@ jobs:
           base: main
           title: "chore(marketplace): register ${{ steps.manifest.outputs.handle }}"
           commit-message: "chore(marketplace): register ${{ steps.manifest.outputs.handle }}"
+          committer: "${{ env.BOT_USERNAME }} <${{ env.BOT_EMAIL }}>"
+          author: "${{ env.BOT_USERNAME }} <${{ env.BOT_EMAIL }}>"
           body: |
-            Registers `${{ steps.manifest.outputs.name }}` in the alfred marketplace.
+            Registers `${{ steps.manifest.outputs.name }}` in the marketplace.
 
             - **Source**: https://github.com/${{ inputs.skill_repo }}
             - **Ref**: `${{ inputs.skill_ref || 'default branch' }}`
