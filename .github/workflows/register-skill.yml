@@ -1,0 +1,158 @@
+name: Register skill in marketplace
+
+on:
+  workflow_dispatch:
+    inputs:
+      skill_repo:
+        description: "Skill repo (e.g., Mr-RedHat-fb/ontology-skill)"
+        required: true
+        type: string
+      skill_ref:
+        description: "Skill ref to register (tag, branch, or SHA). Empty for default branch."
+        required: false
+        default: ""
+        type: string
+      category:
+        description: "Marketplace category. Empty to omit."
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Show the diff without opening a PR."
+        required: false
+        default: false
+        type: boolean
+
+env:
+  MARKETPLACE_REPO: alfred-intelligence/claude-marketplace
+  MARKETPLACE_FORK: Mr-RedHat-fb/claude-marketplace
+  MANIFEST_PATH: .claude-plugin/marketplace.json
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout skill repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.skill_repo }}
+          ref: ${{ inputs.skill_ref }}
+          path: skill
+
+      - name: Read plugin manifest
+        id: manifest
+        working-directory: skill
+        run: |
+          if [[ -f .claude-plugin/plugin.json ]]; then
+            MANIFEST=.claude-plugin/plugin.json
+          elif [[ -f plugin.json ]]; then
+            MANIFEST=plugin.json
+          else
+            echo "::error::no plugin.json found in skill repo"
+            exit 1
+          fi
+
+          NAME=$(jq -r '.name' "$MANIFEST")
+          DESCRIPTION=$(jq -r '.description // ""' "$MANIFEST")
+          VERSION=$(jq -r '.version // ""' "$MANIFEST")
+
+          if [[ -z "$NAME" || "$NAME" == "null" ]]; then
+            echo "::error::plugin.json missing required field: name"
+            exit 1
+          fi
+
+          if [[ -n "$VERSION" && "$VERSION" != "null" ]]; then
+            HANDLE="${NAME}@${VERSION}"
+          else
+            VERSION=""
+            HANDLE="$NAME"
+          fi
+
+          # Use heredoc syntax so multi-line descriptions survive intact.
+          DELIM=$(openssl rand -hex 16)
+          {
+            echo "name=$NAME"
+            echo "version=$VERSION"
+            echo "handle=$HANDLE"
+            echo "description<<$DELIM"
+            echo "$DESCRIPTION"
+            echo "$DELIM"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout marketplace fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MARKETPLACE_FORK }}
+          token: ${{ secrets.MARKETPLACE_PAT }}
+          path: marketplace
+          ref: main
+
+      - name: Sync fork with upstream
+        working-directory: marketplace
+        run: |
+          git config user.name "alfred-marketplace-bot"
+          git config user.email "alfred-marketplace-bot@users.noreply.github.com"
+          git remote add upstream "https://github.com/${MARKETPLACE_REPO}.git"
+          git fetch --quiet upstream main
+          git reset --quiet --hard upstream/main
+
+      - name: Update marketplace manifest
+        id: update
+        working-directory: marketplace
+        env:
+          NAME: ${{ steps.manifest.outputs.name }}
+          DESCRIPTION: ${{ steps.manifest.outputs.description }}
+          CATEGORY: ${{ inputs.category }}
+          REPO: ${{ inputs.skill_repo }}
+        run: |
+          NEW=$(jq -n \
+            --arg name "$NAME" \
+            --arg desc "$DESCRIPTION" \
+            --arg repo "$REPO" \
+            '{name: $name, description: $desc, source: {source: "github", repo: $repo}}')
+          if [[ -n "$CATEGORY" ]]; then
+            NEW=$(echo "$NEW" | jq --arg cat "$CATEGORY" '.category = $cat')
+          fi
+
+          jq --argjson new "$NEW" '
+            if any(.plugins[]?; .name == $new.name)
+            then .plugins |= map(if .name == $new.name then $new else . end)
+            else .plugins += [$new]
+            end
+          ' "$MANIFEST_PATH" > "$MANIFEST_PATH.tmp"
+          mv "$MANIFEST_PATH.tmp" "$MANIFEST_PATH"
+
+          if git diff --quiet -- "$MANIFEST_PATH"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no changes — entry already up to date"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager diff -- "$MANIFEST_PATH"
+          fi
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run && steps.update.outputs.changed == 'true' }}
+        run: echo "::notice::dry-run — not opening PR"
+
+      - name: Open pull request
+        if: ${{ !inputs.dry_run && steps.update.outputs.changed == 'true' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: marketplace
+          token: ${{ secrets.MARKETPLACE_PAT }}
+          push-to-fork: ${{ env.MARKETPLACE_FORK }}
+          branch: register/${{ steps.manifest.outputs.name }}
+          base: main
+          title: "chore(marketplace): register ${{ steps.manifest.outputs.handle }}"
+          commit-message: "chore(marketplace): register ${{ steps.manifest.outputs.handle }}"
+          body: |
+            Registers `${{ steps.manifest.outputs.name }}` in the alfred marketplace.
+
+            - **Source**: https://github.com/${{ inputs.skill_repo }}
+            - **Ref**: `${{ inputs.skill_ref || 'default branch' }}`
+            - **Version**: `${{ steps.manifest.outputs.version || 'unset' }}`
+            - **Description**: ${{ steps.manifest.outputs.description }}
+
+            Triggered by run [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
