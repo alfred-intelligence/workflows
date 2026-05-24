@@ -1,19 +1,27 @@
 #!/usr/bin/env bash
-# register-skill.sh — register a skill in the alfred marketplace.
+# register-skill.sh — register a skill in a Claude Code marketplace.
 #
-# Reads plugin.json from the current dir (or --skill-dir), edits a fork of
-# the marketplace, opens a PR upstream. Requires gh, jq, git.
+# This is the manual fallback for the register-skill workflow. When you run
+# it, you push to your own fork as yourself; commits and PR are your identity.
+# Bot-attributed PRs come from the workflow.
+#
+# Required env (set in your shell or a config file you source):
+#   MARKETPLACE_REPO   The upstream marketplace, owner/repo
+#   MARKETPLACE_FORK   The fork to push to, owner/repo
+#                      (default: derived from current `gh` user)
+#
+# Required tools: gh, jq, git.
 #
 # Usage:
 #   cd ~/code/ontology-skill
-#   ~/code/workflows/scripts/register-skill.sh --category productivity
-# Or:
-#   register-skill.sh --skill-dir ~/code/ontology-skill --category productivity [--dry-run]
+#   register-skill.sh [--category productivity] [--dry-run]
+#
+#   register-skill.sh --skill-dir ~/code/ontology-skill [--category ...] [--dry-run]
 
 set -euo pipefail
 
-MARKETPLACE_REPO="alfred-intelligence/claude-marketplace"
-MARKETPLACE_FORK="${MARKETPLACE_FORK:-Mr-RedHat-fb/claude-marketplace}"
+MARKETPLACE_REPO="${MARKETPLACE_REPO:-}"
+MARKETPLACE_FORK="${MARKETPLACE_FORK:-}"
 MANIFEST_PATH=".claude-plugin/marketplace.json"
 
 SKILL_DIR="$PWD"
@@ -21,7 +29,7 @@ CATEGORY=""
 DRY_RUN=false
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -30,11 +38,10 @@ while [[ $# -gt 0 ]]; do
     --category)   CATEGORY="$2"; shift 2 ;;
     --dry-run)    DRY_RUN=true; shift ;;
     -h|--help)    usage; exit 0 ;;
-    *)            echo "error: unknown arg: $1" >&2; usage; exit 1 ;;
+    *)            echo "error: unknown arg: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
 
-# Required tools — fail early with a clear message instead of cryptic later errors.
 for cmd in gh jq git; do
   command -v "$cmd" >/dev/null 2>&1 || {
     echo "error: $cmd is required but not installed" >&2
@@ -42,10 +49,24 @@ for cmd in gh jq git; do
   }
 done
 
+if [[ -z "$MARKETPLACE_REPO" ]]; then
+  echo "error: MARKETPLACE_REPO env var must be set (e.g., owner/repo)" >&2
+  exit 1
+fi
+
+# Default the fork to the authenticated gh user's namespace if not explicit.
+if [[ -z "$MARKETPLACE_FORK" ]]; then
+  GH_USER=$(gh api user --jq .login 2>/dev/null || true)
+  REPO_NAME="${MARKETPLACE_REPO##*/}"
+  if [[ -z "$GH_USER" ]]; then
+    echo "error: MARKETPLACE_FORK not set and gh is not authenticated" >&2
+    exit 1
+  fi
+  MARKETPLACE_FORK="${GH_USER}/${REPO_NAME}"
+fi
+
 cd "$SKILL_DIR"
 
-# The manifest may live at .claude-plugin/plugin.json or, for flat single-skill
-# plugins, at the repo root.
 if [[ -f .claude-plugin/plugin.json ]]; then
   MANIFEST=.claude-plugin/plugin.json
 elif [[ -f plugin.json ]]; then
@@ -85,15 +106,15 @@ if [[ -z "$REPO" ]]; then
   exit 1
 fi
 
-echo "── skill ──"
-echo "  name=$NAME"
+echo "── inputs ──"
+echo "  skill=$NAME"
 echo "  version=${VERSION:-(unset)}"
-echo "  repo=$REPO"
+echo "  source=$REPO"
 echo "  category=${CATEGORY:-(omitted)}"
+echo "  upstream=$MARKETPLACE_REPO"
+echo "  fork=$MARKETPLACE_FORK"
 echo
 
-# Clone the fork to a temp dir and reset it to upstream/main so we work on
-# top of the latest published state, not stale fork history.
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -103,7 +124,6 @@ git remote add upstream "https://github.com/${MARKETPLACE_REPO}.git"
 git fetch --quiet upstream main
 git reset --quiet --hard upstream/main
 
-# Build the new entry; omit category when empty so the JSON stays clean.
 NEW=$(jq -n \
   --arg name "$NAME" \
   --arg desc "$DESCRIPTION" \
@@ -113,7 +133,6 @@ if [[ -n "$CATEGORY" ]]; then
   NEW=$(echo "$NEW" | jq --arg cat "$CATEGORY" '.category = $cat')
 fi
 
-# Insert if new, update in place if an entry with the same name exists.
 jq --argjson new "$NEW" '
   if any(.plugins[]?; .name == $new.name)
   then .plugins |= map(if .name == $new.name then $new else . end)
@@ -143,14 +162,14 @@ git commit -q -m "chore(marketplace): register $HANDLE"
 git push --quiet --force-with-lease origin "$BRANCH"
 
 FORK_OWNER="${MARKETPLACE_FORK%%/*}"
-PR_BODY=$(cat <<EOF
-Registers \`$NAME\` in the alfred marketplace.
+PR_BODY=$(cat <<BODY
+Registers \`$NAME\` in the marketplace.
 
 - **Source**: https://github.com/$REPO
 - **Version**: ${VERSION:-unset}
 
 Created with [register-skill.sh](https://github.com/alfred-intelligence/workflows/blob/main/scripts/register-skill.sh).
-EOF
+BODY
 )
 
 gh pr create \
